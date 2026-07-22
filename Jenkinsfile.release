@@ -1,7 +1,7 @@
-
 final String branchDevelop = 'develop'
-final String repoOwner    = 'WSO2-Project'
-final String repoName     = 'wso2-apim-app'
+final String repoOwner     = 'WSO2-Project'
+final String repoName      = 'wso2-apim-app'
+final String versionPattern = /\d+\.\d+\.\d+/
 
 pipeline {
     agent any
@@ -15,10 +15,25 @@ pipeline {
         GITHUB_APP = 'github-app-jenkins'
     }
 
+    parameters {
+        booleanParam(
+            name: 'AUTO_BUMP_MINOR',
+            defaultValue: true,
+            description: 'Bump develop to the next MINOR (x.Y+1.0). Uncheck to set the next dev version manually.'
+        )
+        string(
+            name: 'NEXT_DEV_VERSION_OVERRIDE',
+            defaultValue: '',
+            description: 'Explicit next dev version MAJOR.MINOR.PATCH. Used only when AUTO_BUMP_MINOR is unchecked.'
+        )
+    }
+
     stages {
-            stage('Checkout develop') {
+        stage('Checkout develop') {
             steps {
                 cleanWs()
+                // Native GitHub App checkout — no tokens exposed. This also configures
+                // an authenticated 'origin' remote reused by later ls-remote/push steps.
                 gitHubAppCheckout(
                     credentialsId: env.GITHUB_APP,
                     repoOwner: repoOwner,
@@ -32,48 +47,43 @@ pipeline {
         stage('Compute versions') {
             steps {
                 script {
-                    def raw = readFile('VERSION').trim()
+                    String raw = readFile('VERSION').trim()
                     env.RELEASE_VERSION = raw.replace('-SNAPSHOT', '')
 
-                    if (!(env.RELEASE_VERSION ==~ /\d+\.\d+\.\d+/)) {
-                        error "VERSION file must be MAJOR.MINOR.PATCH(-SNAPSHOT). Got: '${raw}'"
+                    if (!(env.RELEASE_VERSION ==~ versionPattern)) {
+                        error("VERSION must be MAJOR.MINOR.PATCH(-SNAPSHOT). Got: '${raw}'")
                     }
 
                     if (params.AUTO_BUMP_MINOR) {
-                        def (major, minor, patch) = env.RELEASE_VERSION.tokenize('.')
-                        env.NEXT_DEV_VERSION = "${major}.${(minor.toInteger() + 1)}.0"
+                        List<String> parts = env.RELEASE_VERSION.tokenize('.')
+                        env.NEXT_DEV_VERSION = "${parts[0]}.${parts[1].toInteger() + 1}.0"
                     } else {
-                        if (!(params.NEXT_DEV_VERSION_OVERRIDE ==~ /\d+\.\d+\.\d+/)) {
-                            error "NEXT_DEV_VERSION_OVERRIDE must be MAJOR.MINOR.PATCH. Got: '${params.NEXT_DEV_VERSION_OVERRIDE}'"
+                        String override = params.NEXT_DEV_VERSION_OVERRIDE
+                        if (!(override ==~ versionPattern)) {
+                            error("NEXT_DEV_VERSION_OVERRIDE must be MAJOR.MINOR.PATCH. Got: '${override}'")
                         }
-                        env.NEXT_DEV_VERSION = params.NEXT_DEV_VERSION_OVERRIDE
+                        env.NEXT_DEV_VERSION = override
                     }
 
                     env.RELEASE_BRANCH = "release/${env.RELEASE_VERSION}"
 
                     currentBuild.displayName = "Cut ${env.RELEASE_BRANCH}"
-                    echo """
-                    ┌─────────────────────────────────────────┐
-                    │ RELEASE_VERSION  : ${env.RELEASE_VERSION}
-                    │ RELEASE_BRANCH   : ${env.RELEASE_BRANCH}
-                    │ NEXT_DEV_VERSION : ${env.NEXT_DEV_VERSION}-SNAPSHOT
-                    └─────────────────────────────────────────┘
-                    """
+                    echo "RELEASE_VERSION=${env.RELEASE_VERSION} | " +
+                        "RELEASE_BRANCH=${env.RELEASE_BRANCH} | " +
+                        "NEXT_DEV_VERSION=${env.NEXT_DEV_VERSION}-SNAPSHOT"
                 }
             }
         }
 
-        stage('Guard: branch must not exist') {
+        stage('Guard: release branch must not exist') {
             steps {
                 script {
-                    def gh = new GitHubHelper(
-                        owner: repoOwner,
-                        repo: repoName,
-                        credentialsId: 'github-app'  // your GitHub App credential
-                    )
-                    def exists = gh.branchExists(env.RELEASE_BRANCH)
-                    if (exists) {
-                        error "${env.RELEASE_BRANCH} already exists on remote. Aborting."
+                    String existing = sh(
+                        script: "git ls-remote --heads origin refs/heads/${env.RELEASE_BRANCH}",
+                        returnStdout: true
+                    ).trim()
+                    if (existing) {
+                        error("${env.RELEASE_BRANCH} already exists on origin. Aborting.")
                     }
                 }
             }
@@ -81,50 +91,40 @@ pipeline {
 
         stage('Create release branch') {
             steps {
-                script {
-                    sh """
-                        git config user.email "jenkins-ci@wso2-project"
-                        git config user.name  "Jenkins CI"
-                        git checkout -B ${env.RELEASE_BRANCH}
-                        echo "${env.RELEASE_VERSION}" > VERSION
-                        git commit -am "Start release ${env.RELEASE_VERSION} [skip ci]"
-                    """
-                }
-                // Push via GitHub API using the app
-                githubAppCheckout([
-                    credentialsId: 'github-app'
-                ]) {
-                    sh "git push origin ${env.RELEASE_BRANCH}"
-                }
+                // Cut release/<version> from develop and de-SNAPSHOT the VERSION file.
+                // Push reuses the authenticated remote configured by gitHubAppCheckout.
+                sh """
+                    git config user.email 'jenkins-ci@wso2-project'
+                    git config user.name 'Jenkins CI'
+                    git checkout -B ${env.RELEASE_BRANCH}
+                    echo '${env.RELEASE_VERSION}' > VERSION
+                    git commit -am 'Start release ${env.RELEASE_VERSION} [skip ci]'
+                    git push origin ${env.RELEASE_BRANCH}
+                """
             }
         }
 
         stage('Bump develop') {
             steps {
-                script {
-                    sh """
-                        git checkout ${branchDevelop}
-                        git pull origin ${branchDevelop}
-                        echo "${env.NEXT_DEV_VERSION}-SNAPSHOT" > VERSION
-                        git commit -am "Bump develop to ${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]"
-                    """
-                }
-                // Push via GitHub API using the app
-                githubAppCheckout([
-                    credentialsId: 'github-app'
-                ]) {
-                    sh "git push origin ${branchDevelop}"
-                }
+                // Advance develop to the next -SNAPSHOT so it never collides with the release line.
+                sh """
+                    git checkout ${branchDevelop}
+                    git pull --ff-only origin ${branchDevelop}
+                    echo '${env.NEXT_DEV_VERSION}-SNAPSHOT' > VERSION
+                    git commit -am 'Bump develop to ${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]'
+                    git push origin ${branchDevelop}
+                """
             }
         }
     }
 
     post {
         success {
-            echo "✅ Created ${env.RELEASE_BRANCH}. Pushes to it will auto-build RCs. develop is now ${env.NEXT_DEV_VERSION}-SNAPSHOT."
+            echo "Created ${env.RELEASE_BRANCH}; pushes to it auto-build RCs."
+            echo "develop is now ${env.NEXT_DEV_VERSION}-SNAPSHOT."
         }
         failure {
-            echo '❌ Release cut failed. No partial state should remain.'
+            echo 'Release cut failed. No partial state should remain.'
         }
         always {
             cleanWs()
