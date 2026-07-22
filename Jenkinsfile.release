@@ -32,13 +32,16 @@ pipeline {
         stage('Checkout develop') {
             steps {
                 cleanWs()
-                // Native GitHub App checkout — no tokens exposed. This also configures
-                // an authenticated 'origin' remote reused by later ls-remote/push steps.
-                gitHubAppCheckout(
-                    credentialsId: env.GITHUB_APP,
-                    repoOwner: repoOwner,
-                    repository: repoName,
-                    branch: branchDevelop
+                // GitHub App credential (GitHub Branch Source plugin) resolves to a
+                // short-lived installation token; the Git plugin consumes it via credentialsId.
+                // localBranch() gives us a real local 'develop' to cut/bump from.
+                checkout scmGit(
+                    userRemoteConfigs: [[
+                        url: "https://github.com/${repoOwner}/${repoName}.git",
+                        credentialsId: env.GITHUB_APP
+                    ]],
+                    branches: [[name: branchDevelop]],
+                    extensions: [localBranch(branchDevelop)]
                 )
                 sh 'git fetch --tags'
             }
@@ -78,10 +81,12 @@ pipeline {
         stage('Guard: release branch must not exist') {
             steps {
                 script {
-                    String existing = sh(
-                        script: "git ls-remote --heads origin refs/heads/${env.RELEASE_BRANCH}",
-                        returnStdout: true
-                    ).trim()
+                    String ref = "refs/heads/${env.RELEASE_BRANCH}"
+                    String existing = withCredentials([
+                        gitUsernamePassword(credentialsId: env.GITHUB_APP)
+                    ]) {
+                        sh(script: "git ls-remote --heads origin ${ref}", returnStdout: true).trim()
+                    }
                     if (existing) {
                         error("${env.RELEASE_BRANCH} already exists on origin. Aborting.")
                     }
@@ -92,28 +97,32 @@ pipeline {
         stage('Create release branch') {
             steps {
                 // Cut release/<version> from develop and de-SNAPSHOT the VERSION file.
-                // Push reuses the authenticated remote configured by gitHubAppCheckout.
-                sh """
-                    git config user.email 'jenkins-ci@wso2-project'
-                    git config user.name 'Jenkins CI'
-                    git checkout -B ${env.RELEASE_BRANCH}
-                    echo '${env.RELEASE_VERSION}' > VERSION
-                    git commit -am 'Start release ${env.RELEASE_VERSION} [skip ci]'
-                    git push origin ${env.RELEASE_BRANCH}
-                """
+                // gitUsernamePassword binds the GitHub App token to the git CLI for push.
+                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                    sh """
+                        git config user.email 'jenkins-ci@wso2-project'
+                        git config user.name 'Jenkins CI'
+                        git checkout -B ${env.RELEASE_BRANCH}
+                        echo '${env.RELEASE_VERSION}' > VERSION
+                        git commit -am 'Start release ${env.RELEASE_VERSION} [skip ci]'
+                        git push origin ${env.RELEASE_BRANCH}
+                    """
+                }
             }
         }
 
         stage('Bump develop') {
             steps {
                 // Advance develop to the next -SNAPSHOT so it never collides with the release line.
-                sh """
-                    git checkout ${branchDevelop}
-                    git pull --ff-only origin ${branchDevelop}
-                    echo '${env.NEXT_DEV_VERSION}-SNAPSHOT' > VERSION
-                    git commit -am 'Bump develop to ${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]'
-                    git push origin ${branchDevelop}
-                """
+                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                    sh """
+                        git checkout ${branchDevelop}
+                        git pull --ff-only origin ${branchDevelop}
+                        echo '${env.NEXT_DEV_VERSION}-SNAPSHOT' > VERSION
+                        git commit -am 'Bump develop to ${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]'
+                        git push origin ${branchDevelop}
+                    """
+                }
             }
         }
     }
