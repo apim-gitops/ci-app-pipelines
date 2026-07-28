@@ -1,7 +1,8 @@
-final String branchMain      = 'main'
+final String branchMain       = 'main'
 final String branchDevelop    = 'develop'
 final String repoOwner        = 'WSO2-Project'
 final String repoName         = 'wso2-apim-app'
+final String repoUrl          = "https://github.com/${repoOwner}/${repoName}.git"
 final String versionPattern   = /\d+\.\d+\.\d+/
 final String releaseBranchRx  = /release\/\d+\.\d+\.\d+/
 
@@ -85,11 +86,12 @@ pipeline {
         stage('Guard: release branch must exist') {
             steps {
                 script {
-                    String ref = "refs/heads/${env.RELEASE_BRANCH}"
-                    String existing = withCredentials([
-                        gitUsernamePassword(credentialsId: env.GITHUB_APP)
-                    ]) {
-                        sh(script: "git ls-remote --heads origin ${ref}", returnStdout: true).trim()
+                    String existing = ''
+                    withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                        existing = sh(
+                            script: "git ls-remote --heads ${repoUrl} refs/heads/${env.RELEASE_BRANCH}",
+                            returnStdout: true
+                        ).trim()
                     }
                     if (!existing) {
                         error("${env.RELEASE_BRANCH} does not exist on origin. Aborting.")
@@ -101,11 +103,12 @@ pipeline {
         stage('Guard: tag must not exist') {
             steps {
                 script {
-                    String ref = "refs/tags/${env.RELEASE_TAG}"
-                    String existing = withCredentials([
-                        gitUsernamePassword(credentialsId: env.GITHUB_APP)
-                    ]) {
-                        sh(script: "git ls-remote --tags origin ${ref}", returnStdout: true).trim()
+                    String existing = ''
+                    withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                        existing = sh(
+                            script: "git ls-remote --tags ${repoUrl} refs/tags/${env.RELEASE_TAG}",
+                            returnStdout: true
+                        ).trim()
                     }
                     if (existing) {
                         error("Tag ${env.RELEASE_TAG} already exists on origin. Aborting.")
@@ -119,30 +122,32 @@ pipeline {
                 cleanWs()
                 checkout scmGit(
                     userRemoteConfigs: [[
-                        url: "https://github.com/${repoOwner}/${repoName}.git",
+                        url: repoUrl,
                         credentialsId: env.GITHUB_APP
                     ]],
                     branches: [[name: branchMain]],
                     extensions: [localBranch(branchMain)]
                 )
                 withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
-                    sh "git fetch --no-tags origin ${branchMain} ${env.RELEASE_BRANCH}"
-                    sh "git checkout -B ${branchMain} origin/${branchMain}"
-                    sh "git reset --hard origin/${branchMain}"
+                    sh """
+                        set -e
+                        git config user.email 'jenkins-ci@wso2-project'
+                        git config user.name 'Jenkins CI'
+                        git fetch --no-tags origin ${branchMain} ${env.RELEASE_BRANCH}
+                        git checkout -B ${branchMain} origin/${branchMain}
+                        git reset --hard origin/${branchMain}
+                    """
                 }
             }
         }
 
         stage('Merge release into main') {
             steps {
-                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
-                    sh """
-                        git config user.email 'jenkins-ci@wso2-project'
-                        git config user.name 'Jenkins CI'
-                        git merge --no-ff origin/${env.RELEASE_BRANCH} \
-                            -m "Merge ${env.RELEASE_BRANCH} into ${branchMain} (release ${env.RELEASE_VERSION})"
-                    """
-                }
+                sh """
+                    set -e
+                    git merge --no-ff origin/${env.RELEASE_BRANCH} \
+                        -m "Merge ${env.RELEASE_BRANCH} into ${branchMain} (release ${env.RELEASE_VERSION})"
+                """
                 script {
                     String v = readFile('VERSION').trim()
                     if (v != env.RELEASE_VERSION) {
@@ -154,11 +159,10 @@ pipeline {
 
         stage('Tag') {
             steps {
-                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
-                    sh """
-                        git tag -a ${env.RELEASE_TAG} -m "Release ${env.RELEASE_VERSION}"
-                    """
-                }
+                sh """
+                    set -e
+                    git tag -a ${env.RELEASE_TAG} -m "Release ${env.RELEASE_VERSION}"
+                """
             }
         }
 
@@ -166,8 +170,9 @@ pipeline {
             steps {
                 withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
                     sh """
+                        set -e
                         git push origin ${branchMain}
-                        git push origin ${env.RELEASE_TAG}
+                        git push origin refs/tags/${env.RELEASE_TAG}
                     """
                 }
             }
@@ -180,7 +185,8 @@ pipeline {
             steps {
                 withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
                     sh """
-                        git checkout -B ${env.HOTFIX_BRANCH} ${env.RELEASE_TAG}
+                        set -e
+                        git checkout -B ${env.HOTFIX_BRANCH} refs/tags/${env.RELEASE_TAG}
                         git push origin ${env.HOTFIX_BRANCH}
                     """
                 }
@@ -197,23 +203,29 @@ pipeline {
                         set -e
                         git fetch --no-tags origin ${branchDevelop}
                         git checkout -B ${branchDevelop} origin/${branchDevelop}
-                        git merge --no-ff origin/${env.RELEASE_BRANCH} \
-                            -m "Merge ${env.RELEASE_BRANCH} back into ${branchDevelop}" || {
-                                # If the only conflict is the VERSION file, take ours
-                                # (we are about to overwrite it anyway).
-                                if git status --porcelain VERSION | grep -q '^UU'; then
-                                    git checkout --ours VERSION
-                                    git add VERSION
-                                    git commit --no-edit
-                                else
-                                    echo "Unresolvable merge conflict on develop:" >&2
-                                    git status >&2
-                                    exit 1
-                                fi
-                            }
+
+                        if ! git merge --no-ff origin/${env.RELEASE_BRANCH} \
+                                -m "Merge ${env.RELEASE_BRANCH} back into ${branchDevelop}"; then
+                            conflicts=\$(git diff --name-only --diff-filter=U)
+                            if [ "\$conflicts" = "VERSION" ]; then
+                                # Only VERSION conflicts; we overwrite it below anyway.
+                                git checkout --ours VERSION
+                                git add VERSION
+                                git commit --no-edit
+                            else
+                                echo "Unresolvable merge conflict on ${branchDevelop}:" >&2
+                                echo "\$conflicts" >&2
+                                git merge --abort
+                                exit 1
+                            fi
+                        fi
+
                         echo '${env.NEXT_DEV_VERSION}-SNAPSHOT' > VERSION
-                        git commit -am "Bump ${branchDevelop} to ${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]" || \
+                        if ! git diff --quiet -- VERSION; then
+                            git commit -m "Bump ${branchDevelop} to ${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]" -- VERSION
+                        else
                             echo "No version change to commit on ${branchDevelop}."
+                        fi
                         git push origin ${branchDevelop}
                     """
                 }
