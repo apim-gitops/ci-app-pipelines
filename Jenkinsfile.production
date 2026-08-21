@@ -5,6 +5,7 @@ final String repoName         = 'wso2-apim-app'
 final String repoUrl          = "https://github.com/${repoOwner}/${repoName}.git"
 final String versionPattern   = /\d+\.\d+\.\d+/
 final String releaseBranchRx  = /release\/\d+\.\d+\.\d+/
+final String WSO2_VERSION     = "4.7.0"
 
 pipeline {
     agent any
@@ -15,7 +16,7 @@ pipeline {
     }
 
     environment {
-        GITHUB_APP = 'github-app-jenkins'
+        GITHUB_APP = 'github-credentials'
     }
 
     parameters {
@@ -150,8 +151,9 @@ pipeline {
                 """
                 script {
                     String v = readFile('VERSION').trim()
-                    if (v != env.RELEASE_VERSION) {
-                        error("VERSION on merged main is '${v}', expected '${env.RELEASE_VERSION}' (no -SNAPSHOT). Refusing to tag.")
+                    String exceptedVersion = WSO2_VERSION + "+" + RELEASE_VERSION
+                    if (v != exceptedVersion) {
+                        error("VERSION on merged main is '${v}', expected '${excepted_version}' (no -SNAPSHOT). Refusing to tag.")
                     }
                 }
             }
