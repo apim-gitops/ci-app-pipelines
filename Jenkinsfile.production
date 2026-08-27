@@ -1,0 +1,248 @@
+final String branchMain      = 'main'
+final String branchDevelop   = 'develop'
+final String repoOwner       = 'WSO2-Project'
+final String repoName        = 'wso2-apim-app'
+final String repoUrl         = "https://github.com/${repoOwner}/${repoName}.git"
+final String versionPattern  = /\d+\.\d+\.\d+/
+final String sourceBranchRx  = /(release|hotfix)\/\d+\.\d+\.\d+/
+
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 15, unit: 'MINUTES')
+    }
+
+    environment {
+        GITHUB_APP = 'github-credentials'
+    }
+
+    parameters {
+        string(
+            name: 'RELEASE_BRANCH',
+            defaultValue: '',
+            description: 'Branch to release: release/X.Y.Z or hotfix/X.Y.Z'
+        )
+        booleanParam(
+            name: 'BUMP_DEVELOP',
+            defaultValue: true,
+            description: 'Merge back into develop and bump VERSION to next -SNAPSHOT.'
+        )
+        string(
+            name: 'NEXT_DEV_VERSION_OVERRIDE',
+            defaultValue: '',
+            description: 'Explicit next dev version MAJOR.MINOR.PATCH (only when BUMP_DEVELOP is checked).'
+        )
+    }
+
+    stages {
+        stage('Resolve inputs') {
+            steps {
+                script {
+                    String rb = params.RELEASE_BRANCH?.trim()
+                    if (!rb) {
+                        error("RELEASE_BRANCH parameter is required (e.g. release/1.2.3 or hotfix/1.2.4).")
+                    }
+                    if (!(rb ==~ sourceBranchRx)) {
+                        error("RELEASE_BRANCH must match 'release/MAJOR.MINOR.PATCH' or 'hotfix/MAJOR.MINOR.PATCH'. Got: '${rb}'")
+                    }
+                    env.RELEASE_BRANCH  = rb
+                    env.RELEASE_VERSION = rb.substring(rb.indexOf('/') + 1)
+                    env.RELEASE_TAG     = env.RELEASE_VERSION
+
+                    // Strictly-greater semver comparator
+                    def semverGt = { String a, String b ->
+                        def pa = a.tokenize('.')*.toInteger()
+                        def pb = b.tokenize('.')*.toInteger()
+                        for (int i = 0; i < 3; i++) {
+                            if (pa[i] != pb[i]) { return pa[i] > pb[i] }
+                        }
+                        return false
+                    }
+
+                    if (params.BUMP_DEVELOP) {
+                        if (params.NEXT_DEV_VERSION_OVERRIDE?.trim()) {
+                            String o = params.NEXT_DEV_VERSION_OVERRIDE.trim()
+                            if (!(o ==~ versionPattern)) {
+                                error("NEXT_DEV_VERSION_OVERRIDE must be MAJOR.MINOR.PATCH. Got: '${o}'")
+                            }
+                            if (!semverGt(o, env.RELEASE_VERSION)) {
+                                error("NEXT_DEV_VERSION_OVERRIDE (${o}) must be greater than the release version (${env.RELEASE_VERSION}).")
+                            }
+                            env.NEXT_DEV_VERSION = o
+                        } else {
+                            List<String> parts = env.RELEASE_VERSION.tokenize('.')
+                            env.NEXT_DEV_VERSION = "${parts[0]}.${parts[1].toInteger() + 1}.0"
+                        }
+                    }
+
+                    currentBuild.displayName = "Prod release ${env.RELEASE_TAG}"
+                    echo "RELEASE_BRANCH=${env.RELEASE_BRANCH} | " +
+                         "RELEASE_TAG=${env.RELEASE_TAG} | " +
+                         "NEXT_DEV_VERSION=${params.BUMP_DEVELOP ? env.NEXT_DEV_VERSION + '-SNAPSHOT' : '(no develop bump)'}"
+                }
+            }
+        }
+
+        stage('Guards: branch exists, tag free') {
+            steps {
+                script {
+                    withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                        String branchExists = sh(
+                            script: "git ls-remote --heads ${repoUrl} refs/heads/${env.RELEASE_BRANCH}",
+                            returnStdout: true
+                        ).trim()
+                        if (!branchExists) {
+                            error("${env.RELEASE_BRANCH} does not exist on origin. Aborting.")
+                        }
+
+                        String tagExists = sh(
+                            script: "git ls-remote --tags ${repoUrl} refs/tags/${env.RELEASE_TAG}",
+                            returnStdout: true
+                        ).trim()
+                        if (tagExists) {
+                            error("Tag ${env.RELEASE_TAG} already exists on origin. Aborting.")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Checkout main') {
+            steps {
+                cleanWs()
+                checkout scmGit(
+                    userRemoteConfigs: [[
+                        url: repoUrl,
+                        credentialsId: env.GITHUB_APP
+                    ]],
+                    branches: [[name: branchMain]],
+                    extensions: [localBranch(branchMain)]
+                )
+                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                    sh """
+                        set -e
+                        git config user.email 'jenkins-ci@wso2-project'
+                        git config user.name  'Jenkins CI'
+                        git fetch --no-tags origin ${branchMain} ${env.RELEASE_BRANCH}
+                        git checkout -B ${branchMain} origin/${branchMain}
+                        git reset --hard origin/${branchMain}
+                    """
+                }
+            }
+        }
+
+        stage('Merge into main + validate VERSION') {
+            steps {
+                sh """
+                    set -e
+                    git merge --no-ff origin/${env.RELEASE_BRANCH} \
+                        -m "Merge ${env.RELEASE_BRANCH} into ${branchMain} (release ${env.RELEASE_VERSION})"
+                """
+                script {
+                    String v = readFile('VERSION').trim()
+                    def m = v =~ /^(\d+\.\d+\.\d+)\+(\d+\.\d+\.\d+)$/
+                    if (!m) {
+                        error("VERSION on merged main must be WSO2+CUSTOM (no -SNAPSHOT). Got: '${v}'. Refusing to tag.")
+                    }
+                    if (m[0][2] != env.RELEASE_VERSION) {
+                        error("VERSION custom part '${m[0][2]}' != RELEASE_VERSION '${env.RELEASE_VERSION}'. Refusing to tag.")
+                    }
+                    // WSO2 prefix used for the develop bump (legacy bugfix: prefix was dropped)
+                    env.WSO2_VERSION = m[0][1]
+                }
+            }
+        }
+
+        stage('Tag') {
+            steps {
+                sh """
+                    set -e
+                    git tag -a ${env.RELEASE_TAG} -m "Release ${env.RELEASE_VERSION}"
+                """
+            }
+        }
+
+        stage('Push main and tag') {
+            steps {
+                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                    sh """
+                        set -e
+                        git push origin ${branchMain} refs/tags/${env.RELEASE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Bump develop') {
+            when {
+                expression { params.BUMP_DEVELOP == true }
+            }
+            steps {
+                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                    sh """
+                        set -e
+                        git fetch --no-tags origin ${branchDevelop}
+                        git checkout -B ${branchDevelop} origin/${branchDevelop}
+
+                        if ! git merge --no-ff origin/${env.RELEASE_BRANCH} \
+                                -m "Merge ${env.RELEASE_BRANCH} back into ${branchDevelop}"; then
+                            conflicts=\$(git diff --name-only --diff-filter=U)
+                            if [ "\$conflicts" = "VERSION" ]; then
+                                git checkout --ours VERSION
+                                git add VERSION
+                                git commit --no-edit
+                            else
+                                echo "Unresolvable merge conflict on ${branchDevelop}:" >&2
+                                echo "\$conflicts" >&2
+                                git merge --abort
+                                exit 1
+                            fi
+                        fi
+
+                        echo "${env.WSO2_VERSION}+${env.NEXT_DEV_VERSION}-SNAPSHOT" > VERSION
+                        if ! git diff --quiet -- VERSION; then
+                            git commit -m "Bump ${branchDevelop} to ${env.WSO2_VERSION}+${env.NEXT_DEV_VERSION}-SNAPSHOT [skip ci]" -- VERSION
+                        else
+                            echo "No version change to commit on ${branchDevelop}."
+                        fi
+                        git push origin ${branchDevelop}
+                    """
+                }
+            }
+        }
+
+        stage('Cleanup: delete finished hotfix branch') {
+            when {
+                expression { env.RELEASE_BRANCH?.startsWith('hotfix/') }
+            }
+            steps {
+                withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
+                    sh "git push origin --delete ${env.RELEASE_BRANCH}"
+                }
+                echo "Deleted ${env.RELEASE_BRANCH} (Gitflow: hotfix branches are short-lived)."
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "Tagged ${env.RELEASE_TAG} on ${branchMain}."
+                echo "https://github.com/${repoOwner}/${repoName}/releases/tag/${env.RELEASE_TAG}"
+                if (params.BUMP_DEVELOP) {
+                    echo "${branchDevelop} is now ${env.WSO2_VERSION}+${env.NEXT_DEV_VERSION}-SNAPSHOT."
+                }
+                echo "If a production fix is needed later, run Jenkinsfile.hotfix with BASE_TAG=${env.RELEASE_TAG}."
+            }
+        }
+        failure {
+            echo 'Release failed. Rerunning is safe: tag-exists guard blocks re-tagging, merge steps are no-ops on repeat.'
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
