@@ -32,6 +32,19 @@ pipeline {
         )
     }
 
+    parameters {
+        booleanParam(
+            name: 'AUTO_BUMP_MINOR',
+            defaultValue: true,
+            description: 'Bump develop to the next MINOR (x.Y+1.0). Uncheck to set the next dev version manually.'
+        )
+        string(
+            name: 'NEXT_DEV_VERSION_OVERRIDE',
+            defaultValue: '',
+            description: 'Explicit next dev version MAJOR.MINOR.PATCH. Used only when AUTO_BUMP_MINOR is unchecked.'
+        )
+    }
+
     stages {
         stage('Checkout develop') {
             steps {
