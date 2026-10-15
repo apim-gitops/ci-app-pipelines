@@ -1,11 +1,9 @@
 final String branchMain       = 'main'
 final String branchDevelop    = 'develop'
-final String repoOwner        = 'WSO2-Project'
+final String repoOwner        = 'apim-gitgflow'
 final String repoName         = 'wso2-apim-app'
 final String repoUrl          = "https://github.com/${repoOwner}/${repoName}.git"
-final String versionPattern   = /\d+\.\d+\.\d+/
 final String releaseBranchRx  = /^(release|hotfix)\/\d+\.\d+\.\d+$/
-final String WSO2_VERSION     = "4.7.0"
 
 pipeline {
     agent any
@@ -24,7 +22,7 @@ pipeline {
     }
 
     environment {
-        GITHUB_APP = 'wso2-apim-app-ci'
+        GITHUB_APP = 'github-credentials'
     }
 
     stages {
@@ -40,11 +38,11 @@ pipeline {
                     if (!(params.RELEASE_BRANCH ==~ releaseBranchRx)) {
                         error("RELEASE_BRANCH must match pattern: release/X.Y.Z or hotfix/X.Y.Z, got: ${params.RELEASE_BRANCH}")
                     }
-                    // Extra safety: never allow main or develop
+                    // Guard on main and develop
                     if (params.RELEASE_BRANCH in [branchMain, branchDevelop]) {
                         error("Refusing to operate on protected branch: ${params.RELEASE_BRANCH}")
                     }
-                    echo "✅ Branch format validated: ${params.RELEASE_BRANCH}"
+                    echo "Branch format validated: ${params.RELEASE_BRANCH}"
                 }
             }
         }
@@ -62,7 +60,7 @@ pipeline {
                     if (!existing) {
                         error("Release branch does not exist on remote: ${params.RELEASE_BRANCH}")
                     }
-                    echo '✅ Release branch exists on remote'
+                    echo 'Release branch exists on remote'
                 }
             }
         }
@@ -81,7 +79,7 @@ pipeline {
                     if (existing) {
                         error("Tag already exists: ${tagName}. Was this release already finalized?")
                     }
-                    echo "✅ Tag ${tagName} does not exist — safe to proceed"
+                    echo "Tag ${tagName} does not exist — safe to proceed"
                 }
             }
         }
@@ -163,7 +161,7 @@ pipeline {
                         git push origin ${env.TAG_NAME}
                     """
                 }
-                echo "✅ Tagged: ${env.TAG_NAME}"
+                echo "Tagged: ${env.TAG_NAME}"
             }
         }
 
@@ -172,7 +170,7 @@ pipeline {
                 withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
                     sh "git push origin ${branchMain}"
                 }
-                echo "✅ Pushed ${branchMain}"
+                echo "Pushed ${branchMain}"
             }
         }
 
@@ -216,7 +214,7 @@ pipeline {
                 withCredentials([gitUsernamePassword(credentialsId: env.GITHUB_APP)]) {
                     sh "git push origin ${branchDevelop}"
                 }
-                echo "✅ Pushed ${branchDevelop} with next SNAPSHOT"
+                echo "Pushed ${branchDevelop} with next SNAPSHOT"
             }
         }
 
@@ -245,7 +243,7 @@ pipeline {
                         """
                     }
 
-                    echo "✅ Deleted ${params.RELEASE_BRANCH}"
+                    echo "Deleted ${params.RELEASE_BRANCH}"
                 }
             }
         }

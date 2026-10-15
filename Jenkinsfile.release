@@ -1,6 +1,6 @@
 final String branchMain       = 'main'
 final String branchDevelop    = 'develop'
-final String repoOwner        = 'WSO2-Project'
+final String repoOwner        = 'apim-gitflow'
 final String repoName         = 'wso2-apim-app'
 final String repoUrl          = "https://github.com/${repoOwner}/${repoName}.git"
 final String versionPattern   = /\d+\.\d+\.\d+/
@@ -194,7 +194,7 @@ pipeline {
                 echo "✅ Created ${env.RELEASE_BRANCH}."
                 echo "   VERSION on release branch : ${env.WSO2_VERSION}+${env.RELEASE_VERSION}"
                 echo "   ${branchDevelop} is now    : ${env.WSO2_VERSION}+${env.NEXT_DEV_VERSION}-SNAPSHOT"
-                echo ""
+                echo ''
                 echo "   Next step: run the production pipeline with RELEASE_BRANCH=${env.RELEASE_BRANCH}"
             }
         }

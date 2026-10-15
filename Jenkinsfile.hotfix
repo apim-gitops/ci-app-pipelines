@@ -1,5 +1,5 @@
 final String branchMain      = 'main'
-final String repoOwner       = 'WSO2-Project'
+final String repoOwner       = 'apim-gitflow'
 final String repoName        = 'wso2-apim-app'
 final String repoUrl         = "https://github.com/${repoOwner}/${repoName}.git"
 final String versionPattern  = /\d+\.\d+\.\d+/
