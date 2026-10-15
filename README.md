@@ -1,268 +1,281 @@
 # ci-app-pipelines
 
-Jenkins pipeline definitions for the **WSO2 API Manager** Gitflow release lifecycle.  
-This repository automates cutting, finalizing, and hotfixing releases for [`WSO2-Project/wso2-apim-app`](https://github.com/WSO2-Project/wso2-apim-app).
+**Jenkins pipelines automating the Gitflow release lifecycle of
+[`wso2-apim-app`](link)**
+
+Part of the [apim-gitops](hub-link) project. Handles branching, merging,
+tagging, and cleanup so releases need no manual git operations.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Repository structure](#repository-structure)
-- [Version format](#version-format)
-- [Gitflow branch model](#gitflow-branch-model)
 - [Pipelines](#pipelines)
-  - [Jenkinsfile.release — Cut a release](#jenkinsfilerelease--cut-a-release)
-  - [Jenkinsfile.production — Finalize a release or hotfix](#jenkinsfileproduction--finalize-a-release-or-hotfix)
-  - [Jenkinsfile.hotfix — Start a hotfix](#jenkinsfilehotfix--start-a-hotfix)
-- [End-to-end workflows](#end-to-end-workflows)
-  - [Standard release](#standard-release)
-  - [Hotfix](#hotfix)
-- [Jenkins jobs](#jenkins-jobs)
-- [Credentials](#credentials)
-- [Linting](#linting)
-- [Protected branches and safety guards](#protected-branches-and-safety-guards)
+  - [Jenkinsfile.release — Cut a Release](#jenkinsfilerelease)
+  - [Jenkinsfile.production — Finalize a Release or Hotfix](#jenkinsfileproduction)
+  - [Jenkinsfile.hotfix — Start a Hotfix](#jenkinsfilehotfix)
+- [Workflows](#workflows)
+- [Setup](#setup)
+- [Safety Guards](#safety-guards)
 
 ---
 
 ## Overview
 
-```
-develop  ──────●──────────────────────────────●─────────────▶
-               │  Jenkinsfile.release          │ (bumped to next -SNAPSHOT)
-               └──▶ release/X.Y.Z ────────────┤
-                                               │ Jenkinsfile.production
-               main ◀─────────────────────────┘ (merged + tagged + release branch deleted)
-                 │
-                 │  Jenkinsfile.hotfix  (branch from tag)
-                 └──▶ hotfix/X.Y.Z ──▶ (Jenkinsfile.production)
-```
+This repository contains three [Gitflow](https://github.com/apim-gitops#4-gitflow-branch-model--protection) Jenkins pipelines that automates the release lifecycle of `wso2-apim-app`. Every branch operation (create, merge,
+tag, push, delete) is performed by Jenkins. 
 
-All git operations (merge, tag, push, branch deletion) are performed by Jenkins using a GitHub App credential; no manual git commands are needed once a pipeline is triggered.
+**Pipeline workflow :**
+```mermaid
+flowchart LR
+    develop["develop<br/>(SNAPSHOT)"] -->|"Jenkinsfile.release"| release["release/X.Y.Z"]
+    release -->|"Jenkinsfile.production"| main["main<br/>(tagged X.Y.Z)"]
+    main -->|"Jenkinsfile.hotfix"| hotfix["hotfix/X.Y.Z"]
+    hotfix -->|"Jenkinsfile.production"| main
 
----
-
-## Repository structure
-
-```
-ci-app-pipelines/
-├── Jenkinsfile.release      # Cuts a release branch from develop
-├── Jenkinsfile.production   # Merges release/hotfix to main, tags, bumps develop
-├── Jenkinsfile.hotfix       # Creates a hotfix branch from a production tag
-├── .groovylintrc.json       # npm-groovy-lint configuration (extends recommended-jenkinsfile)
-├── .gitignore               # Excludes _data/ (local Jenkins home volume)
+    release -. "back-merge" .-> develop
+    hotfix -. "back-merge" .-> develop
 ```
 
 ---
-
-## Version format
-
-Both repositories share a single `VERSION` file with the following format:
-
-```
-<WSO2_VERSION>+<CUSTOM_VERSION>[-SNAPSHOT]
-```
-
-| Segment | Example | Meaning |
-|---|---|---|
-| `WSO2_VERSION` | `4.7.0` | Upstream WSO2 API Manager version |
-| `CUSTOM_VERSION` | `0.1.0` | Project-specific semantic version |
-| `-SNAPSHOT` suffix | present on `develop`, absent on `release/*` and `main` | Indicates an in-development version |
-
-Examples:
-
-| Branch / state | VERSION value |
-|---|---|
-| `develop` (in progress) | `4.7.0+0.1.0-SNAPSHOT` |
-| `release/0.1.0` (cut) | `4.7.0+0.1.0` |
-| `main` (after merge) | `4.7.0+0.1.0` |
-| `develop` (after bump) | `4.7.0+0.2.0-SNAPSHOT` |
-| `hotfix/0.1.1` | `4.7.0+0.1.1` |
-
----
-
-## Gitflow branch model
-
-| Branch | Purpose | Created from | Merged into |
-|---|---|---|---|
-| `main` | Production-ready code, tagged releases | — | — |
-| `develop` | Integration branch, always `-SNAPSHOT` | — | — |
-| `release/X.Y.Z` | Release stabilization | `develop` | `main` + `develop` |
-| `hotfix/X.Y.Z` | Critical production fix | production tag on `main` | `main` + `develop` |
-| `feature/*` | Feature development | `develop` | `develop` (PR) |
-
-`main` and `develop` are **protected branches**. The pipelines contain explicit guards that refuse any operation targeting them directly.
-
----
-
 ## Pipelines
 
-### `Jenkinsfile.release` — Cut a release
+Each pipeline is a standalone, manually triggered Jenkins job. Internally they
+run in **phases**; please refer to 
+[Workflows](#workflows) ro see in which order trigger the pipelines.
 
-**Purpose:** Create a `release/X.Y.Z` branch from `develop` and immediately advance `develop` to the next `-SNAPSHOT` version.
+| Pipeline | Input | Result |
+|---|---|---|
+| [`Jenkinsfile.release`](#jenkinsfilerelease) | none (optional bump settings) | `release/X.Y.Z` created, `develop` advanced |
+| [`Jenkinsfile.production`](#jenkinsfileproduction) | `RELEASE_BRANCH` | Merged to `main`, tagged, `develop` synced |
+| [`Jenkinsfile.hotfix`](#jenkinsfilehotfix) | `BASE_TAG` | `hotfix/X.Y.Z` created from a tag |
+---
 
-**Trigger:** Manual — run on the Jenkins *CRB* job.
+### Jenkinsfile.release
 
-**Parameters:**
+**Cuts a release.** Creates `release/X.Y.Z` from `develop` and advances
+`develop` to the next `-SNAPSHOT`.
+
+**Parameters**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `AUTO_BUMP_MINOR` | Boolean | `true` | Bump `develop` to the next MINOR (`x.Y+1.0-SNAPSHOT`). Uncheck to set the version manually. |
-| `NEXT_DEV_VERSION_OVERRIDE` | String | _(empty)_ | Explicit next dev version (`MAJOR.MINOR.PATCH`). Only used when `AUTO_BUMP_MINOR` is unchecked. |
+| `AUTO_BUMP_MINOR` | Boolean | `true` | Bump `develop` to next MINOR (`X.(Y+1).0-SNAPSHOT`) |
+| `NEXT_DEV_VERSION_OVERRIDE` | String | _(empty)_ | Explicit next dev version when auto-bump is off |
 
-**Stages:**
+**Phases**
 
-1. **Checkout develop** — cleans workspace, checks out `develop`, fetches `main` and `develop`.
-2. **Compute versions** — reads `VERSION`, validates it is a `X.Y.Z+A.B.C-SNAPSHOT`, determines `RELEASE_VERSION` and `NEXT_DEV_VERSION`.
-3. **Guard: release branch must not exist** — aborts if `release/X.Y.Z` already exists on the remote.
-4. **Create release branch** — creates `release/X.Y.Z`, strips `-SNAPSHOT` from `VERSION`, commits, and pushes.
-5. **Bump develop** — switches back to `develop`, writes the next SNAPSHOT version, commits, and pushes.
-
-**Post-run state:**
-
+```mermaid
+flowchart LR
+    p1["Prepare<br/>Checkout develop,<br/>compute versions"] --> p2["Guard<br/>Release branch must<br/>not exist on remote"]
+    p2 --> p3["Cut<br/>Create release branch<br/>(strip SNAPSHOT)"]
+    p3 --> p4["Advance<br/>Bump develop to<br/>next SNAPSHOT"]
 ```
-release/X.Y.Z  →  VERSION: 4.7.0+X.Y.Z          (ready for stabilization)
-develop        →  VERSION: 4.7.0+X.(Y+1).0-SNAPSHOT
-```
+
+**Result**
+
+| Branch | `VERSION` |
+|---|---|
+| `release/X.Y.Z` | `4.7.0+X.Y.Z` |
+| `develop` | `4.7.0+X.(Y+1).0-SNAPSHOT` |
 
 ---
 
-### `Jenkinsfile.production` — Finalize a release or hotfix
+### Jenkinsfile.production
 
-**Purpose:** Merge a `release/X.Y.Z` or `hotfix/X.Y.Z` branch into `main`, create a semver tag, back-merge into `develop`, bump `develop` to the next patch SNAPSHOT, and delete the release/hotfix branch.
+**Finalizes a release or hotfix.** Merges `release/X.Y.Z` or `hotfix/X.Y.Z`
+into `main`, tags it, back-merges to `develop`, and deletes the source branch.
 
-**Trigger:** Manual — typically run immediately after stabilization on the release branch is complete.
-
-**Parameters:**
+**Parameters**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `RELEASE_BRANCH` | String | _(required)_ | Branch to finalize, e.g. `release/1.2.3` or `hotfix/1.2.4`. |
+| `RELEASE_BRANCH` | String | _(required)_ | e.g. `release/1.2.3` or `hotfix/1.2.4` |
 
-**Stages:**
+**Phases**
 
-1. **Guard: validate release branch format** — validates the `release/X.Y.Z` or `hotfix/X.Y.Z` pattern; rejects `main`/`develop`.
-2. **Guard: release branch must exist** — verifies the branch exists on the remote.
-3. **Guard: release tag must NOT exist** — prevents re-finalizing an already-released version.
-4. **Checkout and configure git** — sets the Jenkins CI git identity.
-5. **Fetch all required branches** — fetches `main`, `develop`, and the release branch without tags.
-6. **Resolve versions from release branch** — reads the `VERSION` file on the release branch; expects `WSO2+CUSTOM` (no `-SNAPSHOT`).
-7. **Merge release to main** — `--no-ff` merge of the release branch into `main`.
-8. **Tag release on main** — creates and pushes an annotated tag `X.Y.Z`.
-9. **Push main** — pushes the updated `main`.
-10. **Merge release to develop** — `--no-ff` merge into `develop`.
-11. **Bump develop to next SNAPSHOT** — increments the patch digit, writes `X.Y.(Z+1)-SNAPSHOT`, commits.
-12. **Push develop** — pushes `develop`.
-13. **Delete release branch** — deletes the `release/X.Y.Z` or `hotfix/X.Y.Z` branch from the remote.
-
-**Post-run state:**
-
+```mermaid
+flowchart LR
+    p1["Guard<br/>Format, branch exists,<br/>tag is free"] --> p2["Prepare<br/>Configure git, fetch<br/>branches, resolve version"]
+    p2 --> p3["Publish to main<br/>Merge, tag,<br/>push"]
+    p3 --> p4["Sync develop<br/>Back-merge, bump,<br/>push"]
+    p4 --> p5["Cleanup<br/>Delete source branch"]
 ```
-main           →  VERSION: 4.7.0+X.Y.Z  (tagged X.Y.Z)
-develop        →  VERSION: 4.7.0+X.Y.(Z+1)-SNAPSHOT
-release/X.Y.Z  →  deleted
-```
+
+| Phase | What it does |
+|---|---|
+| **Guard** | Regex check (`release/X.Y.Z` or `hotfix/X.Y.Z`, rejects `main`/`develop`), remote branch exists, tag does not exist yet |
+| **Prepare** | Sets the Jenkins CI git identity, fetches `main`, `develop` and the source branch, reads `VERSION` (must not contain `-SNAPSHOT`) |
+| **Publish to main** | `git merge --no-ff` with `[ci skip]`, annotated tag `X.Y.Z`, push `main` and the tag |
+| **Sync develop** | `git merge --no-ff` back-merge, patch bump to `X.Y.(Z+1)-SNAPSHOT`, push `develop` |
+| **Cleanup** | Deletes the source branch from the remote |
+
+
+**Result**
+
+| Branch / ref | State |
+|---|---|
+| `main` | `VERSION: 4.7.0+X.Y.Z`, tagged `X.Y.Z` |
+| `develop` | `VERSION: 4.7.0+X.Y.(Z+1)-SNAPSHOT` |
+| `release/X.Y.Z` or `hotfix/X.Y.Z` | deleted |
+
+> The push to `main` is what triggers the
+> [`wso2-apim-app` pipeline](https://github.com/apim-gitops/wso2-apim-app#ci-pipeline)
+> (Docker build, push, Helm update).
 
 ---
 
-### `Jenkinsfile.hotfix` — Start a hotfix
+### Jenkinsfile.hotfix
 
-**Purpose:** Create a `hotfix/X.Y.Z` branch from an existing production tag, updating `VERSION` to the hotfix version.
+**Starts a hotfix.** Creates `hotfix/X.Y.Z` from an existing production tag.
 
-**Trigger:** Manual.
-
-**Parameters:**
+**Parameters**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `BASE_TAG` | String | _(required)_ | Production tag to branch from, e.g. `1.2.3`. |
-| `HOTFIX_VERSION_OVERRIDE` | String | _(empty)_ | Explicit hotfix version. Default: `BASE_TAG` patch + 1. |
+| `BASE_TAG` | String | _(required)_ | Production tag, e.g. `0.3.0` |
+| `HOTFIX_VERSION_OVERRIDE` | String | _(empty)_ | Explicit version. Default: `BASE_TAG` patch + 1 |
 
-**Stages:**
+**Phases**
 
-1. **Resolve inputs** — validates `BASE_TAG` format; computes `HOTFIX_VERSION` (patch+1 unless overridden); sets `HOTFIX_BRANCH = hotfix/X.Y.Z`.
-2. **Guards: tag exists, hotfix branch free** — verifies the base tag exists and the hotfix branch does not.
-3. **Create hotfix branch** — checks out the tag via `FETCH_HEAD`, writes the new `VERSION`, commits, and pushes the branch.
-
-**Post-run state:**
-
-```
-hotfix/X.Y.Z  →  VERSION: 4.7.0+X.Y.Z  (branched from tag BASE_TAG)
+```mermaid
+flowchart LR
+    p1["Prepare<br/>Validate tag format,<br/>compute hotfix version"] --> p2["Guard<br/>Tag exists,<br/>hotfix branch is free"]
+    p2 --> p3["Cut<br/>Checkout tag, write VERSION,<br/>commit, push"]
 ```
 
-Developers commit fixes directly on the hotfix branch. When ready, run `Jenkinsfile.production` with `RELEASE_BRANCH=hotfix/X.Y.Z`.
+**Result**
+
+| Branch | `VERSION` |
+|---|---|
+| `hotfix/X.Y.Z` | `4.7.0+X.Y.Z` (branched from `BASE_TAG`) |
 
 ---
 
-## End-to-end workflows
+## Workflows
 
-### Standard release
+> These pipelines cover the **Gitflow release lifecycle** only. The Docker build,
+> Docker Hub push, and Helm update are handled by the
+> [`wso2-apim-app` pipeline](https://github.com/apim-gitops/wso2-apim-app#ci-pipeline),
+> and the Kubernetes sync by ArgoCD. For the full end-to-end picture, see the
+> [organization README](https://github.com/apim-gitops#architecture).
 
+### Standard Release
+
+```mermaid
+flowchart LR
+    step1["1. Feature branches → merge PRs to develop"]
+    step2["2. Trigger Jenkinsfile.release"]
+    step2a["release/X.Y.Z created<br/>develop bumped to next SNAPSHOT"]
+    step3["3. (Optional) QA / stabilize on release/X.Y.Z"]
+    step4["4. Trigger Jenkinsfile.production<br/>RELEASE_BRANCH=release/X.Y.Z"]
+    step4a["main merged + tagged<br/>develop back-merged + bumped<br/>release branch deleted"]
+    step5["5. wso2-apim-app pipeline triggered on main<br/>Docker image pushed, Helm chart updated"]
+
+    step1 --> step2 --> step2a --> step3 --> step4 --> step4a --> step5
 ```
-1. Develop on feature/* branches → merge PRs to develop
-2. Trigger Jenkinsfile.release
-   └─ release/X.Y.Z created, develop bumped to next SNAPSHOT
-3. (Optional) stabilize / QA on release/X.Y.Z
-4. Trigger Jenkinsfile.production with RELEASE_BRANCH=release/X.Y.Z
-   └─ main merged + tagged, develop bumped, release branch deleted
-```
+
+**See also:** 
+[Branching and releases](https://github.com/apim-gitops#branching-and-releases)
+for the branch model, image tags per branch, and version format.
 
 ### Hotfix
 
+```mermaid
+flowchart LR
+    step1["1. Identify regression on production tag (e.g. 0.3.0)"]
+    step2["2. Trigger Jenkinsfile.hotfix<br/>BASE_TAG=0.3.0"]
+    step2a["hotfix/0.3.1 created from tag"]
+    step3["3. Commit fix(es) on hotfix/0.3.1"]
+    step4["4. Trigger Jenkinsfile.production<br/>RELEASE_BRANCH=hotfix/0.3.1"]
+    step4a["main merged + tagged 0.3.1<br/>develop back-merged<br/>hotfix branch deleted"]
+    step5["5. wso2-apim-app pipeline triggered on main<br/>Docker image pushed, Helm chart updated"]
+
+    step1 --> step2 --> step2a --> step3 --> step4 --> step4a --> step5
 ```
-1. Identify regression on a production tag (e.g. 1.2.3)
-2. Trigger Jenkinsfile.hotfix with BASE_TAG=1.2.3
-   └─ hotfix/1.2.4 created from tag 1.2.3
-3. Commit fix(es) on hotfix/1.2.4
-4. Trigger Jenkinsfile.production with RELEASE_BRANCH=hotfix/1.2.4
-   └─ main merged + tagged 1.2.4, develop bumped, hotfix branch deleted
-```
+
+**See also:** [Branching and releases](https://github.com/apim-gitops#branching-and-releases)
+for how `hotfix/*` branches are versioned and tagged.
+
 
 ---
 
-## Jenkins jobs
+## Setup
 
-| Job name | Jenkinsfile | Type | Description |
-|---|---|---|---|
-| `CRB` | `Jenkinsfile.release` | Pipeline | Cuts a release branch from `develop` |
-| `Multibranch` | `Jenkinsfile` (in app repo) | Multibranch Pipeline | Scans `wso2-apim-app`, builds all branches and PRs |
+These pipelines are plain Jenkinsfiles with no hardcoded job configuration.
+To run them, create one Jenkins job per pipeline and provide the credentials below.
 
-The `Multibranch` job polls the `WSO2-Project/wso2-apim-app` repository every 3 minutes (180 s) using the GitHub Branch Source plugin. It discovers branches and both origin and fork pull requests.
+### Jenkins jobs
 
-The `Jenkinsfile.production` and `Jenkinsfile.hotfix` pipelines should each be configured as separate Pipeline jobs pointing to this repository.
+Each pipeline runs as a separate **Pipeline job** using *Pipeline script from SCM*
+pointing at this repository.
 
----
-
-## Credentials
-
-All pipelines authenticate to GitHub using a **Jenkins credential ID**. Two credential IDs appear across the files:
-
-| Credential ID | Used in | Description |
+| Job name | Script path | Purpose |
 |---|---|---|
-| `wso2-apim-app-ci` | `Jenkinsfile.production` | GitHub App credential for the production finalization pipeline |
-| `github-credentials` | `Jenkinsfile.release`, `Jenkinsfile.hotfix` | GitHub App (or username/token) credential |
-| `jenkins-github-app` | Job configs (`_data/`) | GitHub App credential used by Jenkins job definitions |
+| `CRB` | `Jenkinsfile.release` | Cut a release branch |
+| `FR` | `Jenkinsfile.production` | Finalize a release or hotfix |
+| `HF` | `Jenkinsfile.hotfix` | Start a hotfix |
 
-Credentials must be stored in the Jenkins credential store as **Username with password** or **GitHub App** entries and must have push access to `WSO2-Project/wso2-apim-app`.
+**Job configuration (same for all three):**
+
+| Setting | Value |
+|---|---|
+| Definition | Pipeline script from SCM |
+| SCM | Git, `https://github.com/gitops-apim/ci-app-pipelines.git` |
+| Branch | `main` |
+| Script Path | see table above |
+| Triggers | None (manual only) |
+
+> The pipelines check out the target repository (`wso2-apim-app`) themselves,
+> so the job's own SCM only provides the Jenkinsfile.
+
+### Credentials
+
+Create these in Jenkins under *Manage Jenkins → Credentials*.
+
+| Credential ID | Used in | Type |
+|---|---|---|
+| `wso2-apim-app-ci` | `Jenkinsfile.production` | GitHub App credential |
+| `github-credentials` | `Jenkinsfile.release`, `Jenkinsfile.hotfix` | GitHub App or username/token |
+
+### Required permissions
+
+**GitHub (credentials above):**
+
+| Permission | Scope | Why |
+|---|---|---|
+| Contents: read & write | `wso2-apim-app` | Push branches, tags and merge commits, delete branches |
+| Metadata: read | `wso2-apim-app` | Required by GitHub Apps |
+
+
+A Github app must be used and installed on `wso2-apim-app` only.
+
+**Branch protection:** `main` and `develop` are protected. The identity used by
+these credentials must be allowed to push to them, either by being added to the
+bypass list or the push allowlist. Otherwise `Jenkinsfile.production` fails when
+it pushes the merge to `main`.
+
+**Jenkins:**
+
+| Requirement | Why |
+|---|---|
+| Git installed on the agent | All pipelines run git commands directly |
+| Agent with network access to GitHub | Fetch, push, `ls-remote` |
+| Users allowed to run the three jobs | Jobs are manual; restrict them to release managers |
 
 ---
 
-## Linting
+## Safety Guards
 
-Groovy/Jenkinsfile syntax is checked with [npm-groovy-lint](https://github.com/nvuillam/npm-groovy-lint) using the `recommended-jenkinsfile` ruleset. The only override is `maxNestedBlockDepth: 7`.
+Every pipeline includes explicit runtime guards:
 
-```bash
-npx npm-groovy-lint Jenkinsfile.release Jenkinsfile.production Jenkinsfile.hotfix
-```
-
----
-
-## Protected branches and safety guards
-
-Every pipeline includes explicit runtime guards to prevent accidental operations on `main` or `develop`:
-
-- Branch name format is validated via regex before any git operation.
-- Remote existence of required branches/tags is checked via `git ls-remote` before checkout.
-- Duplicate tag creation is rejected (idempotency check).
-- `[ci skip]` / `[skip ci]` markers are added to all automated commits to avoid triggering downstream CI loops.
-- `disableConcurrentBuilds()` is set on all pipelines to prevent parallel runs against the same branches.
+| Guard | Mechanism | Pipelines |
+|---|---|---|
+| **Branch name format** | Regex validation (`release/X.Y.Z`, `hotfix/X.Y.Z`) | All three |
+| **Protected branch protection** | Explicit rejection of `main`/`develop` as targets | All three |
+| **Remote existence check** | `git ls-remote` before checkout | All three |
+| **Idempotency** | Tag and branch existence checks before creation | All three |
+| **No concurrent runs** | `disableConcurrentBuilds()` | All three |
+| **CI loop prevention** | `[ci skip]` / `[skip ci]` markers on automated commits | All three |
+| **Workspace hygiene** | `cleanWs()` in `post` / `always` | All three |
